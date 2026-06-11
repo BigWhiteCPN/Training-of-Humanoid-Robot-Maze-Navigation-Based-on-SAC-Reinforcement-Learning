@@ -1,0 +1,408 @@
+import os
+import time
+import multiprocessing
+import sys
+from collections import deque
+from collections import defaultdict
+from typing import Callable, Dict, List, Optional, Tuple, Union
+
+# 1. 全局配置中心 (必须放在 import matplotlib 之前！)
+class Config:
+    # --- 训练设置 ---
+    # 并行环境数量 (训练时建议 4~16，观看时会自动变为 1)
+    num_envs = 1                
+    total_timesteps = 2_000_000 
+    lr = 3e-4                   
+    seed = 42                   
+    
+    # --- 显示与调试模式开关 ---
+    # True  = 观看模式 (有窗口，单进程，能看到机器人动)
+    # False = 训练模式 (无窗口，多进程，速度快，后台绘图)
+    render = True              
+    
+    resume_from = None
+    # resume_from = "./sac_visual_avoidance_logs/sac_nav_interrupted.zip"
+    
+    # --- 路径设置 ---
+    model_xml = "/home/iansten/code/IsaacLabExtensionTemplate/scripts/resources/mjcf/Linnxil_fifteen_angle_bs_copy_20260302.xml"
+    policy_path = "/home/iansten/code/IsaacLabExtensionTemplate/scripts/visual_train/policy_20251026.pt"
+    log_dir = "./sac_visual_avoidance_logs/"
+    
+    # --- 环境参数 ---
+    decimation = 50             
+    history_length = 15         
+    state_feature_dim = 9       
+    vision_feature_dim = 64     
+    
+    # 动态障碍物配置
+    enable_dynamic_obstacles = False 
+
+    # --- Diffusion 配置 ---
+    enable_diffusion_planner = True  # 开关
+    diffusion_weight_path = "./diffusion_weights/ckpt_latest.pt" # 权重路径
+
+# 2. 动态设置 Matplotlib 后端 (防止崩溃的关键)
+import matplotlib
+
+if not Config.render:
+    # 【训练模式】：强制使用 Agg 后端
+    # Agg 是非交互式的，不依赖 X11 或 GUI 线程，绝对不会崩溃，但无法弹窗。
+    print("--> [System] 训练模式: 启用 Agg 后端 (无窗口，安全稳定)")
+    matplotlib.use('Agg') 
+else:
+    # 【观看模式】：使用默认 GUI 后端 (如 TkAgg, Qt5Agg)
+    # 允许弹窗，但必须配合单进程使用 (DummyVecEnv)。
+    print("--> [System] 观看模式: 启用 GUI 后端 (有窗口)")
+    # 如果默认后端不显示，可以取消下一行的注释尝试强制指定
+    # matplotlib.use('TkAgg') 
+
+import matplotlib.pyplot as plt
+
+# 3. 其他依赖导入
+import torch
+import torch.nn as nn
+import numpy as np
+import gymnasium as gym
+from stable_baselines3 import SAC
+from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv, VecMonitor
+from stable_baselines3.common.callbacks import CheckpointCallback, BaseCallback, EvalCallback
+from stable_baselines3.common.utils import set_random_seed
+from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
+
+# 确保 robot_visual_env.py 在路径下，且该文件内不要包含 matplotlib.use()
+from robot_visual_env_defusion import RobotVisualEnv
+
+# 4. 自定义网络结构 (Transformer/GRU)
+class SequenceFusionExtractor(BaseFeaturesExtractor):
+    def __init__(self, observation_space: gym.spaces.Dict, 
+                 state_feature_dim=9, 
+                 history_length=15,
+                 d_model=128):
+        # 这里的 features_dim 是最终输出给 SAC Policy 的特征维度
+        features_dim = 256
+        super().__init__(observation_space, features_dim)
+        
+        # 1. 视觉处理 CNN (替代了原先环境里的 VisionModule)
+        # 自动获取输入通道数 (Frame Stack)
+        n_input_channels = observation_space['vision_features'].shape[0] # 通常是 3
+        
+        self.vision_cnn = nn.Sequential(
+            # 输入: [Batch, 3, 48, 64]
+            nn.Conv2d(n_input_channels, 16, kernel_size=5, stride=2, padding=2), 
+            nn.ReLU(),
+            nn.Conv2d(16, 32, kernel_size=3, stride=2, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1),
+            nn.ReLU(),
+            nn.Flatten(),
+            # 计算 Flatten 后的维度: 64通道 * 6高 * 8宽 = 3072
+            nn.Linear(3072, 128), 
+            nn.ReLU()
+        )
+
+        # 2. 状态序列处理 (GRU)
+        self.state_sub_dim = state_feature_dim
+        self.seq_len = history_length
+        
+        self.state_embedding = nn.Linear(state_feature_dim, d_model)
+        self.gru = nn.GRU(input_size=d_model, hidden_size=d_model, num_layers=2, batch_first=True)
+        
+        # 3. 融合层: 视觉特征(128) + 时序特征(d_model) -> 最终特征(256)
+        self.fusion_layer = nn.Sequential(
+            nn.Linear(128 + d_model, features_dim),
+            nn.ReLU()
+        )
+
+    def forward(self, observations):
+        # --- 处理图像 ---
+        # observations['vision_features'] 是 (Batch, 3, 48, 64)
+        vision_input = observations['vision_features']
+        # 简单的归一化 (如果是深度图，且范围在0-10米左右，除以10归一化比较好，或者交给LayerNorm)
+        # 这里假设输入已经是 float32，如果不确定范围，可以先不做，或者像之前一样 clamp
+        # vision_input = torch.clamp(vision_input, 0, 10.0) / 10.0 
+        
+        vis_feat = self.vision_cnn(vision_input)
+        
+        # --- 处理状态序列 ---
+        batch_size = observations['state_history'].shape[0]
+        state_seq = observations['state_history'].view(batch_size, self.seq_len, self.state_sub_dim)
+        
+        x = self.state_embedding(state_seq)
+        x = torch.relu(x)
+        gru_out, _ = self.gru(x)
+        temporal_feat = gru_out[:, -1, :] # 取最后一个时间步
+        
+        # --- 融合 ---
+        combined = torch.cat([vis_feat, temporal_feat], dim=1)
+        output = self.fusion_layer(combined)
+        return output
+    
+# 5. 回调函数
+class FailureAnalysisCallback(BaseCallback):
+    """
+    分析失败原因并绘制分布图。
+    在 Agg 模式下只保存文件；在 GUI 模式下 plt.savefig 依然有效。
+    """
+    def __init__(self, save_dir, check_freq=5000, verbose=1):
+        super().__init__(verbose)
+        self.save_dir = os.path.join(save_dir, "analysis_plots")
+        os.makedirs(self.save_dir, exist_ok=True)
+        self.check_freq = check_freq
+        self.history_len = 1000 
+        self.reasons = deque(maxlen=self.history_len)
+        self.positions = deque(maxlen=self.history_len)
+
+    def _on_step(self) -> bool:
+        for info in self.locals['infos']:
+            if 'termination_reason' in info:
+                reason = info['termination_reason']
+                if reason != "running":
+                    self.reasons.append(reason)
+                    self.positions.append((info['robot_pos'], reason))
+        
+        if self.n_calls % self.check_freq == 0 and len(self.reasons) > 0:
+            self._generate_report()
+        return True
+
+    def _generate_report(self):
+        total = len(self.reasons)
+        counts = {
+            "success": self.reasons.count("success"),
+            "collision": self.reasons.count("collision"),
+            "fall": self.reasons.count("fall"),
+            "timeout": self.reasons.count("timeout")
+        }
+        
+        # 记录到 TensorBoard
+        self.logger.record("analysis/success_rate", counts['success'] / total)
+        self.logger.record("analysis/collision_rate", counts['collision'] / total)
+        
+        self._plot_death_map(counts)
+
+    def _plot_death_map(self, counts):
+        fig, ax = plt.subplots(figsize=(10, 10))
+        
+        coll_x, coll_y = [], []
+        fall_x, fall_y = [], []
+        time_x, time_y = [], []
+        succ_x, succ_y = [], []
+        
+        for pos, reason in self.positions:
+            if reason == 'collision':
+                coll_x.append(pos[0]); coll_y.append(pos[1])
+            elif reason == 'fall':
+                fall_x.append(pos[0]); fall_y.append(pos[1])
+            elif reason == 'timeout':
+                time_x.append(pos[0]); time_y.append(pos[1])
+            elif reason == 'success':
+                succ_x.append(pos[0]); succ_y.append(pos[1])
+
+        ax.scatter(coll_x, coll_y, c='red', marker='x', label=f'Collision ({counts["collision"]})', alpha=0.6)
+        ax.scatter(fall_x, fall_y, c='orange', marker='^', label=f'Fall ({counts["fall"]})', alpha=0.6)
+        ax.scatter(time_x, time_y, c='blue', marker='o', label=f'Timeout ({counts["timeout"]})', alpha=0.3)
+        ax.scatter(succ_x, succ_y, c='green', marker='*', label=f'Success ({counts["success"]})', alpha=0.3)
+
+        ax.set_xlim(-5, 5)
+        ax.set_ylim(-5, 5)
+        ax.set_title(f"Termination Map (Step {self.num_timesteps})")
+        ax.legend()
+        ax.grid(True)
+        
+        save_path = os.path.join(self.save_dir, f"death_map_{self.num_timesteps}.png")
+        plt.savefig(save_path)
+        plt.close(fig) # 释放内存
+
+class DetailedRewardAnalysisCallback(BaseCallback):
+    def __init__(self, log_freq: int = 1000, verbose: int = 1):
+        super().__init__(verbose)
+        self.log_freq = log_freq
+        self.reward_buffer = defaultdict(list)
+
+    def _on_step(self) -> bool:
+        for info in self.locals['infos']:
+            if 'rewards' in info:
+                for key, value in info['rewards'].items():
+                    self.reward_buffer[key].append(value)
+                if 'distance_to_goal' in info:
+                    self.reward_buffer['Dist'].append(info['distance_to_goal'])
+
+        if self.n_calls % self.log_freq == 0:
+            self._log_and_print_stats()
+            self.reward_buffer = defaultdict(list)
+        return True
+
+    def _log_and_print_stats(self):
+        sorted_keys = sorted(self.reward_buffer.keys())
+        log_items = []
+        for key in sorted_keys:
+            values = self.reward_buffer[key]
+            if not values: continue
+            mean_val = np.mean(values)
+            if "Dist" in key:
+                self.logger.record(f"analysis_metrics/{key}", mean_val)
+            else:
+                self.logger.record(f"detailed_rewards/{key}_mean", mean_val)
+            log_items.append(f"{key}: {mean_val:.3f}")
+
+        log_str = f"[Step: {self.num_timesteps:<8}] | " + " | ".join(log_items)
+        print(log_str)
+
+def linear_schedule(initial_value: float) -> Callable[[float], float]:
+    def func(progress_remaining: float) -> float:
+        return progress_remaining * initial_value
+    return func
+
+# 辅助函数：创建环境
+def make_env_fn(rank, seed, model_path, policy_path, render_mode=None, decimation=50, history_length=15, enable_dynamic_obstacles=False, use_diffusion=False, diff_path=None):
+    def _init():
+        env = RobotVisualEnv(
+            model_path=model_path,
+            low_level_policy_path=policy_path,
+            render_mode=render_mode,
+            render_decimation=decimation,
+            history_length=history_length,
+            enable_dynamic_obstacles=enable_dynamic_obstacles, 
+            use_diffusion_planner=use_diffusion,
+            diffusion_model_path=diff_path
+        )
+        env.reset(seed=seed + rank) 
+        return env
+    return _init
+
+# 6. 主函数
+def main():
+    num_cpu = multiprocessing.cpu_count()
+    
+    # ---------------------------------------------------------
+    # 根据 Config.render 决定环境配置
+    # ---------------------------------------------------------
+    if Config.render:
+        # 【观看模式】
+        actual_num_envs = 1
+        use_subproc = False # 必须为 False，否则子进程无法操作主进程窗口
+        render_mode = 'human' # 传递给 Env，开启 visualize
+        print(f"--> [Mode] 观看模式 (GUI): 单环境, render_mode='human'")
+    else:
+        # 【训练模式】
+        actual_num_envs = max(1, min(Config.num_envs, num_cpu - 2))
+        use_subproc = True # 开启多进程加速
+        render_mode = None # 传递给 Env，关闭 visualize
+        print(f"--> [Mode] 训练模式 (Headless): {actual_num_envs} 并行环境, render_mode=None")
+
+    env_kwargs = {
+        "model_path": Config.model_xml,
+        "policy_path": Config.policy_path,
+        "render_mode": render_mode,
+        "decimation": Config.decimation,
+        "history_length": Config.history_length,
+        "enable_dynamic_obstacles": Config.enable_dynamic_obstacles,
+        # 传递配置
+        "use_diffusion": Config.enable_diffusion_planner,
+        "diff_path": Config.diffusion_weight_path
+    }
+
+    # 创建 VecEnv
+    if use_subproc and actual_num_envs > 1:
+        env = SubprocVecEnv([make_env_fn(i, Config.seed, **env_kwargs) for i in range(actual_num_envs)])
+    else:
+        env = DummyVecEnv([make_env_fn(0, Config.seed, **env_kwargs)])
+
+    # 包装 Monitor
+    env = VecMonitor(env, os.path.join(Config.log_dir, "train_monitor"))
+
+    # 创建评估环境 (DummyVecEnv 避免冲突)
+    eval_env_kwargs = env_kwargs.copy()
+    eval_env_kwargs['render_mode'] = None  # 强制不渲染
+    
+    eval_env = DummyVecEnv([make_env_fn(999, Config.seed + 999, **eval_env_kwargs)])
+    eval_env = VecMonitor(eval_env, os.path.join(Config.log_dir, "eval_monitor"))
+    
+    # 配置回调
+    eval_callback = EvalCallback(
+        eval_env,
+        best_model_save_path=os.path.join(Config.log_dir, "best_model"),
+        log_path=os.path.join(Config.log_dir, "eval_logs"),
+        eval_freq=max(100000 // actual_num_envs, 1), 
+        deterministic=True,
+        render=False,
+        n_eval_episodes=5
+    )
+    
+    checkpoint_callback = CheckpointCallback(
+        save_freq=max(200000 // actual_num_envs, 1),
+        save_path=os.path.join(Config.log_dir, "checkpoints/"),
+        name_prefix="sac_nav",
+        save_replay_buffer=False,
+        verbose=1
+    )
+
+    fail_analysis_callback = FailureAnalysisCallback(save_dir=Config.log_dir, check_freq=20000)
+    analysis_callback = DetailedRewardAnalysisCallback(log_freq=100)
+    
+    callbacks = [eval_callback, checkpoint_callback, fail_analysis_callback, analysis_callback]
+
+    # 网络参数
+    policy_kwargs = dict(
+        features_extractor_class=SequenceFusionExtractor,
+        features_extractor_kwargs=dict(
+            state_feature_dim=Config.state_feature_dim,
+            history_length=Config.history_length,
+            d_model=128
+        ),
+        net_arch=dict(pi=[256, 256], qf=[256, 256]),
+        share_features_extractor=False
+    )
+    
+    lr_schedule = linear_schedule(Config.lr)
+
+    # 加载或新建模型
+    if Config.resume_from and os.path.exists(Config.resume_from):
+        print(f"--> 正在从检查点恢复: {Config.resume_from}")
+        model = SAC.load(Config.resume_from, env=env, learning_rate=lr_schedule, device="cuda", custom_objects=policy_kwargs)
+    else:
+        print("--> 初始化全新 SAC 模型 (With GRU/Sequence Extractor)")
+        model = SAC(
+            "MultiInputPolicy",
+            env,
+            policy_kwargs=policy_kwargs,
+            verbose=1,
+            tensorboard_log=Config.log_dir,
+            learning_rate=3e-4,
+            buffer_size=400_000,
+            batch_size=256,
+            gamma=0.99,
+            tau=0.005,
+            ent_coef='auto',
+            train_freq=(100, "step"), 
+            gradient_steps=50,       
+            learning_starts=5000,
+            device="cuda"
+        )
+
+    print(f"--- 开始训练 (Total Steps: {Config.total_timesteps}) ---")
+    try:
+        model.learn(
+            total_timesteps=Config.total_timesteps,
+            callback=callbacks,
+            tb_log_name="SAC_Nav_GRU",
+            reset_num_timesteps=(Config.resume_from is None),
+            progress_bar=True
+        )
+        final_path = os.path.join(Config.log_dir, "sac_nav_final.zip")
+        model.save(final_path)
+        print(f"训练完成。最终模型保存至: {final_path}")
+        
+    except KeyboardInterrupt:
+        print("\n训练被用户中断。正在保存当前模型...")
+        model.save(os.path.join(Config.log_dir, "sac_nav_interrupted.zip"))
+    finally:
+        env.close()
+        eval_env.close()
+
+if __name__ == '__main__':
+    # 显式设置启动方法，增加稳定性
+    multiprocessing.set_start_method('spawn', force=True)
+    
+    os.makedirs(Config.log_dir, exist_ok=True)
+    torch.backends.cudnn.benchmark = True
+    main()

@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+*.log
+*.tmp
+*.bak
+
+MUJOCO_LOG.TXT
+*.npz
+*.zip
+sac_*_logs/
+advanced_end2end_nav_logs/
+runs/
+wandb/
