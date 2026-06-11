@@ -1,7 +1,6 @@
 # End2End Navigation Trainer
 
-This directory contains the integrated training system described in
-`../ADVANCED_END2END_NAV_OPTIMIZATION_PLAN.md`.
+This directory contains the integrated end-to-end navigation training system.
 
 It keeps the existing three-layer robot stack:
 
