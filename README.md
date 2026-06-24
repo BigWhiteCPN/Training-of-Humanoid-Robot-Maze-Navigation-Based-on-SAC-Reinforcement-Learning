@@ -8,6 +8,38 @@
 
 - `train_visual.py`: 基础视觉导航 SAC 训练入口。
 - `train_visual_random_map.py`: 随机地图训练入口。
+- `train_visual_random_map_transformer.py`: 随机地图 Transformer 融合版 SAC 训练入口。
+- `transformer_fusion_extractor.py`: GRU 状态序列到局部栅格地图 token 的 cross-attention 特征融合器。
 - `train_visual_end2end.py`: 端到端课程学习训练入口。
 - `end2end_nav_train/`: 分阶段训练流程，包括数据采集、策略预训练、critic 更新和 checkpoint 导出。
-- `play.py`, `play_random_map.py`, `play_end2end.py`: 模型测试和可视化入口。
+- `play.py`, `play_random_map.py`, `play_random_map_transformer.py`, `play_end2end.py`: 模型测试和可视化入口。
+
+## Transformer Random Map SAC
+
+Transformer 版本复用 `robot_visual_env_random_map.py` 的环境、观测、奖励和终止逻辑，只替换 SAC 的 feature extractor。`CrossAttentionFusionExtractor` 使用 CNN 保留局部地图的空间 token，用 GRU 编码 15 帧机器人状态历史，并以状态 token 作为 query 对地图 token 做 cross-attention，输出给 SAC actor 和 critic。
+
+默认训练配置：
+
+- 日志目录：`sac_lidar_logs_random_transformer/`
+- replay buffer：`3_000_000`
+- batch size：`512`
+- transformer：`d_model=128`, `num_heads=4`, `ffn_dim=256`, `dropout=0.05`
+- SAC：`learning_rate=2e-5`, `gamma=0.993`, `tau=0.0005`, `ent_coef="auto"`
+
+启动训练：
+
+```bash
+python3 train_visual_random_map_transformer.py
+```
+
+播放已训练模型：
+
+```bash
+python3 play_random_map_transformer.py sac_lidar_logs_random_transformer/best_model/best_model.zip
+```
+
+如需测试动态障碍物：
+
+```bash
+python3 play_random_map_transformer.py sac_lidar_logs_random_transformer/best_model/best_model.zip --enable_obstacles
+```
