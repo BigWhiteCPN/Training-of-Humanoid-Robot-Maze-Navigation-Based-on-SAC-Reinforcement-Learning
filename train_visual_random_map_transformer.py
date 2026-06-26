@@ -9,7 +9,6 @@ import sys
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 import torch
-from stable_baselines3 import SAC
 from stable_baselines3.common.callbacks import CheckpointCallback, EvalCallback
 from stable_baselines3.common.vec_env import (
     DummyVecEnv,
@@ -19,6 +18,7 @@ from stable_baselines3.common.vec_env import (
 )
 
 from difficulty_balanced_replay_buffer import DifficultyBalancedDictReplayBuffer
+from popart_sac import PopArtSAC
 from robot_visual_env_random_map_transformer import RobotVisualEnv
 from train_visual_random_map import (
     Config as RandomMapConfig,
@@ -48,6 +48,10 @@ class Config(RandomMapConfig):
 
     difficulty_balanced_replay = True
     difficulty_replay_bins = (5.0, 8.0, 12.0, 16.0)
+
+    use_popart = True
+    popart_beta = 3e-4
+    popart_min_std = 1.0
 
     transformer_d_model = 128
     transformer_num_heads = 4
@@ -200,7 +204,7 @@ def main():
 
     if Config.resume_from and os.path.exists(Config.resume_from):
         print(f"--> Resuming transformer model: {Config.resume_from}")
-        model = SAC.load(
+        model = PopArtSAC.load(
             Config.resume_from,
             env=env,
             learning_rate=lr_schedule,
@@ -210,6 +214,9 @@ def main():
                 "learning_rate": lr_schedule,
                 "replay_buffer_class": replay_buffer_class,
                 "replay_buffer_kwargs": replay_buffer_kwargs,
+                "use_popart": Config.use_popart,
+                "popart_beta": Config.popart_beta,
+                "popart_min_std": Config.popart_min_std,
             },
         )
     else:
@@ -217,7 +224,7 @@ def main():
             "--> Initializing SAC with state-query/map-key-value "
             "cross-attention"
         )
-        model = SAC(
+        model = PopArtSAC(
             "MultiInputPolicy",
             env,
             policy_kwargs=policy_kwargs,
@@ -228,6 +235,9 @@ def main():
             batch_size=Config.batch_size,
             replay_buffer_class=replay_buffer_class,
             replay_buffer_kwargs=replay_buffer_kwargs,
+            use_popart=Config.use_popart,
+            popart_beta=Config.popart_beta,
+            popart_min_std=Config.popart_min_std,
             gamma=0.993,
             tau=0.0005,
             ent_coef="auto",
