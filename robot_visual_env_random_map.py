@@ -816,11 +816,15 @@ class RobotVisualEnv(gym.Env):
             "distance_progress": 30.0, "goal_basin": 3.0, "timeout_progress_bonus": 300.0,
         }
         self.distance_progress_clip = 0.05
-        self.progress_potential_sigma = 6.0
+        self.progress_potential_sigma = 0.5
         self.progress_potential_gamma = 0.993
-        self.goal_basin_sigma = 2.0
+        self.goal_basin_sigma_ratio = 0.2
+        self.goal_basin_sigma_min = 1.2
+        self.goal_basin_sigma_max = 3.0
         self.goal_milestones = ((2.0, 20.0), (1.2, 50.0), (0.8, 80.0))
         self.reached_goal_milestones = set()
+        self.path_len_start = 1.0
+        self.reward_distance_scale = 1.0
         
         # self.reward_scales = {
         #     "success": 50.0, 
@@ -970,6 +974,11 @@ class RobotVisualEnv(gym.Env):
             self.current_waypoint_index = 1
         else:
             self.current_path = None
+
+    def _calculate_path_length(self, path):
+        if path is None or len(path) < 2:
+            return 0.0
+        return float(np.sum(np.linalg.norm(np.diff(path, axis=0), axis=1)))
 
     def _calculate_cross_track_error(self, robot_pos, path, start_idx=0):
         if path is None or len(path) < 2: return 0.0
@@ -1290,6 +1299,12 @@ class RobotVisualEnv(gym.Env):
         # 规划新回合的路线
         self._update_path()
         if self.current_path is None: return self.reset(seed=seed, options=options)
+        self.path_len_start = max(
+            self._calculate_path_length(self.current_path),
+            self.dist_to_goal_start,
+            1.0,
+        )
+        self.reward_distance_scale = max(self.dist_to_goal_start, 1.0)
         # 【关键修复 2】：路径规划完成后，强制补画一帧！
         # 否则直到下一次执行 step() 之前，屏幕上都不会显示新的路径
         if self.render_mode == 'human':
@@ -1417,11 +1432,13 @@ class RobotVisualEnv(gym.Env):
             penalty_exist = self.reward_scales["exist_penalty"]
 
             dist_to_final_goal = np.linalg.norm(pos_after - self.goal_pos)
+            prev_norm_dist = self.prev_dist_to_goal / self.reward_distance_scale
+            norm_dist = dist_to_final_goal / self.reward_distance_scale
             prev_goal_potential = 1.0 - np.tanh(
-                self.prev_dist_to_goal / self.progress_potential_sigma
+                prev_norm_dist / self.progress_potential_sigma
             )
             goal_potential = 1.0 - np.tanh(
-                dist_to_final_goal / self.progress_potential_sigma
+                norm_dist / self.progress_potential_sigma
             )
             potential_progress = (
                 self.progress_potential_gamma * goal_potential
@@ -1437,7 +1454,12 @@ class RobotVisualEnv(gym.Env):
             )
             self.prev_dist_to_goal = dist_to_final_goal
             
-            goal_basin = np.exp(-((dist_to_final_goal / self.goal_basin_sigma) ** 2))
+            adaptive_goal_sigma = np.clip(
+                self.reward_distance_scale * self.goal_basin_sigma_ratio,
+                self.goal_basin_sigma_min,
+                self.goal_basin_sigma_max,
+            )
+            goal_basin = np.exp(-((dist_to_final_goal / adaptive_goal_sigma) ** 2))
             reward_goal_basin = self.reward_scales["goal_basin"] * goal_basin
             
             reward_milestone = 0.0
@@ -1483,7 +1505,9 @@ class RobotVisualEnv(gym.Env):
                     termination_reason = "timeout"
                 
                 # 【修改这里】：只有在因超时结束时，或者将进度奖励打大折扣，才给予进度奖励
-                progress_ratio = 1.0 - (dist_to_final_goal / self.dist_to_goal_start)
+                progress_ratio = 1.0 - (
+                    dist_to_final_goal / self.reward_distance_scale
+                )
                 progress_ratio = np.clip(progress_ratio, 0.0, 1.0)
                 
                 if collision or fell:
@@ -1505,13 +1529,16 @@ class RobotVisualEnv(gym.Env):
         info_dict = {
             "is_success": succeeded,
             "distance_to_goal": dist_to_final_goal,
+            "difficulty_start_dist": self.dist_to_goal_start,
+            "difficulty_path_len": self.path_len_start,
             "termination_reason": termination_reason,
             "robot_pos": pos_after.copy(),
             "rewards": {
                 "path": reward_path, "cte": reward_cte, "vel": reward_velocity,
                 "head": reward_heading, "safe": reward_safety,
                 "progress": reward_progress, "goal": reward_goal_basin,
-                "milestone": reward_milestone, "dist": dist_to_final_goal 
+                "milestone": reward_milestone, "dist": dist_to_final_goal,
+                "norm_dist": norm_dist, "goal_sigma": adaptive_goal_sigma
             }
         }
 

@@ -11,8 +11,14 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 import torch
 from stable_baselines3 import SAC
 from stable_baselines3.common.callbacks import CheckpointCallback, EvalCallback
-from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv, VecMonitor
+from stable_baselines3.common.vec_env import (
+    DummyVecEnv,
+    SubprocVecEnv,
+    VecMonitor,
+    VecNormalize,
+)
 
+from difficulty_balanced_replay_buffer import DifficultyBalancedDictReplayBuffer
 from robot_visual_env_random_map_transformer import RobotVisualEnv
 from train_visual_random_map import (
     Config as RandomMapConfig,
@@ -35,6 +41,13 @@ class Config(RandomMapConfig):
     batch_size = 512
     checkpoint_freq = 500_000
     min_free_gpu_memory_gib = 2.0
+
+    normalize_rewards = True
+    reward_clip = 10.0
+    resume_vecnormalize = None
+
+    difficulty_balanced_replay = True
+    difficulty_replay_bins = (5.0, 8.0, 12.0, 16.0)
 
     transformer_d_model = 128
     transformer_num_heads = 4
@@ -100,6 +113,22 @@ def main():
     else:
         env = DummyVecEnv(env_fns)
     env = VecMonitor(env, os.path.join(Config.log_dir, "train_monitor"))
+    if Config.normalize_rewards:
+        if Config.resume_vecnormalize and os.path.exists(Config.resume_vecnormalize):
+            print(f"--> Loading VecNormalize stats: {Config.resume_vecnormalize}")
+            env = VecNormalize.load(Config.resume_vecnormalize, env)
+            env.training = True
+            env.norm_obs = False
+            env.norm_reward = True
+        else:
+            env = VecNormalize(
+                env,
+                training=True,
+                norm_obs=False,
+                norm_reward=True,
+                clip_reward=Config.reward_clip,
+                gamma=0.993,
+            )
 
     eval_env_kwargs = env_kwargs.copy()
     eval_env_kwargs["render_mode"] = None
@@ -109,6 +138,24 @@ def main():
     eval_env = VecMonitor(
         eval_env, os.path.join(Config.log_dir, "eval_monitor")
     )
+    if Config.normalize_rewards:
+        eval_env = VecNormalize(
+            eval_env,
+            training=False,
+            norm_obs=False,
+            norm_reward=False,
+            clip_reward=Config.reward_clip,
+            gamma=0.993,
+        )
+
+    replay_buffer_class = None
+    replay_buffer_kwargs = None
+    if Config.difficulty_balanced_replay:
+        replay_buffer_class = DifficultyBalancedDictReplayBuffer
+        replay_buffer_kwargs = {
+            "difficulty_key": "difficulty_path_len",
+            "bin_edges": Config.difficulty_replay_bins,
+        }
 
     callbacks = [
         EvalCallback(
@@ -125,6 +172,7 @@ def main():
             save_path=os.path.join(Config.log_dir, "checkpoints"),
             name_prefix="sac_lidar_random_transformer",
             save_replay_buffer=False,
+            save_vecnormalize=Config.normalize_rewards,
             verbose=1,
         ),
         FailureAnalysisCallback(
@@ -160,6 +208,8 @@ def main():
             custom_objects={
                 "policy_kwargs": policy_kwargs,
                 "learning_rate": lr_schedule,
+                "replay_buffer_class": replay_buffer_class,
+                "replay_buffer_kwargs": replay_buffer_kwargs,
             },
         )
     else:
@@ -176,6 +226,8 @@ def main():
             learning_rate=2e-5,
             buffer_size=Config.replay_buffer_size,
             batch_size=Config.batch_size,
+            replay_buffer_class=replay_buffer_class,
+            replay_buffer_kwargs=replay_buffer_kwargs,
             gamma=0.993,
             tau=0.0005,
             ent_coef="auto",
@@ -201,6 +253,10 @@ def main():
             Config.log_dir, "sac_lidar_transformer_final.zip"
         )
         model.save(final_path)
+        if Config.normalize_rewards and model.get_vec_normalize_env() is not None:
+            model.get_vec_normalize_env().save(
+                os.path.join(Config.log_dir, "vecnormalize_final.pkl")
+            )
         print(f"Training complete. Model saved to: {final_path}")
     except KeyboardInterrupt:
         interrupted_path = os.path.join(
@@ -208,6 +264,10 @@ def main():
         )
         print(f"\nTraining interrupted. Saving to: {interrupted_path}")
         model.save(interrupted_path)
+        if Config.normalize_rewards and model.get_vec_normalize_env() is not None:
+            model.get_vec_normalize_env().save(
+                os.path.join(Config.log_dir, "vecnormalize_interrupted.pkl")
+            )
     finally:
         env.close()
         eval_env.close()
