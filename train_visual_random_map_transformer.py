@@ -29,10 +29,8 @@ class Config(RandomMapConfig):
     log_dir = "./sac_lidar_logs_random_transformer/"
     resume_from = None
 
-    # Sized for a workstation with 32 GiB RAM and a 12 GiB GPU. The original
-    # 6.5M replay buffer requires about 22 GiB before Python/environment
-    # overhead, while the transformer update batch is substantially heavier
-    # than the original concatenation extractor.
+    # T3 baseline: less conservative than T5, but still stable enough for the
+    # transformer critic.
     replay_buffer_size = 3_000_000
     batch_size = 512
     checkpoint_freq = 500_000

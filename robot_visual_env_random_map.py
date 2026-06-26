@@ -809,11 +809,15 @@ class RobotVisualEnv(gym.Env):
         
         self.reward_scales = {
             "success": 2500.0, "collision_penalty": -400.0, "fall_penalty": -300.0,
-            "path_following": 10.0, "cte_penalty": 0.05, "velocity_to_goal": 1.0,
-            "heading_to_goal": 0.6, "obstacle_avoidance": 0.03, "turn_penalty": 0.000001,
+            "path_following": 10.0, "cte_penalty": 0.05, "velocity_to_goal": 0.8,
+            "heading_to_goal": 0.4, "obstacle_avoidance": 0.03, "turn_penalty": 0.000001,
             "action_rate_penalty": 0.01, "unstable_penalty": -0.00001, "exist_penalty": -0.001,
             "distance_to_goal": 0.0, "exploration_turn": 0.0, "goal_discovery": 0.0, "safety_margin": 0.5,
+            "distance_progress": 8.0, "goal_basin": 2.0, "timeout_progress_bonus": 300.0,
         }
+        self.distance_progress_clip = 0.2
+        self.goal_milestones = ((2.0, 50.0), (1.2, 100.0), (0.8, 150.0))
+        self.reached_goal_milestones = set()
         
         # self.reward_scales = {
         #     "success": 50.0, 
@@ -1274,6 +1278,7 @@ class RobotVisualEnv(gym.Env):
         self.dist_to_goal_start = np.linalg.norm(self.data.qpos[:2] - self.goal_pos)
         if self.dist_to_goal_start < 0.1: self.dist_to_goal_start = 0.1
         self.prev_dist_to_goal = self.dist_to_goal_start 
+        self.reached_goal_milestones.clear()
         
         # 此时 current_path 已被置空，绘图时不会画出旧线
         self._update_perception()
@@ -1408,14 +1413,38 @@ class RobotVisualEnv(gym.Env):
             penalty_act_rate = -self.reward_scales["action_rate_penalty"] * np.linalg.norm(action - self.last_applied_action)
             penalty_exist = self.reward_scales["exist_penalty"]
 
+            dist_to_final_goal = np.linalg.norm(pos_after - self.goal_pos)
+            distance_progress = self.prev_dist_to_goal - dist_to_final_goal
+            distance_progress = np.clip(
+                distance_progress,
+                -self.distance_progress_clip,
+                self.distance_progress_clip,
+            )
+            reward_progress = (
+                distance_progress * self.reward_scales["distance_progress"]
+            )
+            self.prev_dist_to_goal = dist_to_final_goal
+            
+            goal_basin = np.clip((2.0 - dist_to_final_goal) / 2.0, 0.0, 1.0)
+            reward_goal_basin = goal_basin * self.reward_scales["goal_basin"]
+            
+            reward_milestone = 0.0
+            for milestone_idx, (radius, bonus) in enumerate(self.goal_milestones):
+                if (
+                    dist_to_final_goal <= radius
+                    and milestone_idx not in self.reached_goal_milestones
+                ):
+                    reward_milestone += bonus
+                    self.reached_goal_milestones.add(milestone_idx)
+
             sub_reward = (
                 reward_path + reward_cte + reward_velocity + 
                 reward_heading + reward_obstacle + reward_safety + 
-                penalty_turn + penalty_unstable + 
-                penalty_act_rate + penalty_exist
+                reward_progress + reward_goal_basin + reward_milestone +
+                penalty_turn + penalty_unstable + penalty_act_rate +
+                penalty_exist
             )
-            
-            dist_to_final_goal = np.linalg.norm(pos_after - self.goal_pos)
+
             succeeded = dist_to_final_goal < 0.6
             collision = self._check_collision()
             fell = up_alignment < self.fall_threshold
@@ -1449,8 +1478,10 @@ class RobotVisualEnv(gym.Env):
                     # 惩罚必须痛！撞墙或摔倒不给进度分，或者给极少的进度分
                     progress_bonus = 10 * progress_ratio 
                 else:
-                    # 如果是安全走到超时，给予正常的进度分鼓励
-                    progress_bonus = 1000.0 * progress_ratio 
+                    progress_bonus = (
+                        self.reward_scales["timeout_progress_bonus"]
+                        * progress_ratio
+                    )
                     
                 term_reward += progress_bonus
 
@@ -1466,7 +1497,9 @@ class RobotVisualEnv(gym.Env):
             "robot_pos": pos_after.copy(),
             "rewards": {
                 "path": reward_path, "cte": reward_cte, "vel": reward_velocity,
-                "head": reward_heading, "safe": reward_safety, "dist": dist_to_final_goal 
+                "head": reward_heading, "safe": reward_safety,
+                "progress": reward_progress, "goal": reward_goal_basin,
+                "milestone": reward_milestone, "dist": dist_to_final_goal 
             }
         }
 
