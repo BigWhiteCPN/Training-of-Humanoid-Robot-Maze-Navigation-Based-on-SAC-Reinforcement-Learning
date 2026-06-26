@@ -813,10 +813,13 @@ class RobotVisualEnv(gym.Env):
             "heading_to_goal": 0.4, "obstacle_avoidance": 0.03, "turn_penalty": 0.000001,
             "action_rate_penalty": 0.01, "unstable_penalty": -0.00001, "exist_penalty": -0.001,
             "distance_to_goal": 0.0, "exploration_turn": 0.0, "goal_discovery": 0.0, "safety_margin": 0.5,
-            "distance_progress": 8.0, "goal_basin": 2.0, "timeout_progress_bonus": 300.0,
+            "distance_progress": 30.0, "goal_basin": 3.0, "timeout_progress_bonus": 300.0,
         }
-        self.distance_progress_clip = 0.2
-        self.goal_milestones = ((2.0, 50.0), (1.2, 100.0), (0.8, 150.0))
+        self.distance_progress_clip = 0.05
+        self.progress_potential_sigma = 6.0
+        self.progress_potential_gamma = 0.993
+        self.goal_basin_sigma = 2.0
+        self.goal_milestones = ((2.0, 20.0), (1.2, 50.0), (0.8, 80.0))
         self.reached_goal_milestones = set()
         
         # self.reward_scales = {
@@ -1414,19 +1417,28 @@ class RobotVisualEnv(gym.Env):
             penalty_exist = self.reward_scales["exist_penalty"]
 
             dist_to_final_goal = np.linalg.norm(pos_after - self.goal_pos)
-            distance_progress = self.prev_dist_to_goal - dist_to_final_goal
-            distance_progress = np.clip(
-                distance_progress,
+            prev_goal_potential = 1.0 - np.tanh(
+                self.prev_dist_to_goal / self.progress_potential_sigma
+            )
+            goal_potential = 1.0 - np.tanh(
+                dist_to_final_goal / self.progress_potential_sigma
+            )
+            potential_progress = (
+                self.progress_potential_gamma * goal_potential
+                - prev_goal_potential
+            )
+            potential_progress = np.clip(
+                potential_progress,
                 -self.distance_progress_clip,
                 self.distance_progress_clip,
             )
             reward_progress = (
-                distance_progress * self.reward_scales["distance_progress"]
+                potential_progress * self.reward_scales["distance_progress"]
             )
             self.prev_dist_to_goal = dist_to_final_goal
             
-            goal_basin = np.clip((2.0 - dist_to_final_goal) / 2.0, 0.0, 1.0)
-            reward_goal_basin = goal_basin * self.reward_scales["goal_basin"]
+            goal_basin = np.exp(-((dist_to_final_goal / self.goal_basin_sigma) ** 2))
+            reward_goal_basin = self.reward_scales["goal_basin"] * goal_basin
             
             reward_milestone = 0.0
             for milestone_idx, (radius, bonus) in enumerate(self.goal_milestones):
